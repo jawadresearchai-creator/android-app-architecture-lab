@@ -25,10 +25,10 @@ jobs:
 
     steps:
       - name: Checkout lab
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
@@ -57,12 +57,29 @@ jobs:
           set -euo pipefail
           rm -rf work/reference-jadx "reports/$REF_SLUG"
           mkdir -p work/reference-jadx "reports/$REF_SLUG"
+
+          set +e
           "$RUNNER_TEMP/jadx/bin/jadx" \
             --deobf \
             --show-bad-code \
             -d work/reference-jadx \
             "$RUNNER_TEMP/reference/reference.apk" \
             2>&1 | tee "reports/$REF_SLUG/JADX_LOG.txt"
+          JADX_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          echo "$JADX_EXIT" > "reports/$REF_SLUG/JADX_EXIT_CODE.txt"
+          SOURCE_COUNT=$(find work/reference-jadx/sources -type f \( -name '*.java' -o -name '*.kt' \) 2>/dev/null | wc -l)
+          echo "$SOURCE_COUNT" > "reports/$REF_SLUG/DECOMPILED_SOURCE_FILE_COUNT.txt"
+
+          if [[ "$SOURCE_COUNT" -eq 0 ]]; then
+            echo "JADX produced no decompiled source files; treating run as failed." >&2
+            exit 1
+          fi
+
+          if [[ "$JADX_EXIT" -ne 0 ]]; then
+            echo "JADX returned exit code $JADX_EXIT, but produced $SOURCE_COUNT source files. Continuing with partial output."
+          fi
 
       - name: Generate architecture reports
         shell: bash
@@ -79,6 +96,8 @@ jobs:
             echo "source=https://github.com/egdels/makeacopy"
             echo "apk_sha256=$APK_SHA256"
             echo "jadx_version=$($RUNNER_TEMP/jadx/bin/jadx --version)"
+            echo "jadx_exit_code=$(cat reports/$REF_SLUG/JADX_EXIT_CODE.txt)"
+            echo "decompiled_source_files=$(cat reports/$REF_SLUG/DECOMPILED_SOURCE_FILE_COUNT.txt)"
             echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "reports/$REF_SLUG/REFERENCE_PROVENANCE.txt"
 
