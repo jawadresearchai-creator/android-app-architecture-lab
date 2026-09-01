@@ -1,0 +1,11 @@
+# Android packages are intentionally not ignored: upload the package you want analyzed into input/.
+# Remove analyzed packages from the repository when no longer needed.
+
+# Local/generated analysis
+work/
+reports/
+jadx-output/
+*.log
+__pycache__/
+*.pyc
+.DS_Store
