@@ -50,34 +50,40 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/camscanner"
-          mkdir -p "$OUT"
+          APKMD_ROOT="$RUNNER_TEMP/apkmd"
+          mkdir -p "$OUT" "$APKMD_ROOT"
 
-          # APKMirror blocks ordinary scripted downloads. This maintained MIT tool
-          # follows the normal APKMirror download flow. We still trust nothing
-          # until the downloaded bytes match the SHA-256 of the user-supplied APKM.
+          # Install the maintained downloader locally. Its published npm bin wrapper
+          # currently lacks a usable shebang on Linux, so invoke the JS CLI with Node.
+          cd "$APKMD_ROOT"
+          npm init -y >/dev/null 2>&1
+          npm install --no-audit --no-fund apkmirror-downloader@2.0.11
+          APKMD="$APKMD_ROOT/node_modules/apkmirror-downloader/dist/cli.js"
+          test -f "$APKMD"
+          cd "$GITHUB_WORKSPACE"
+
+          run_download() {
+            node "$APKMD" download \
+              intsig-pte camscanner-phone-pdf-creator \
+              --version "$REF_VERSION" \
+              "$@" \
+              --outfile camscanner-reference.apkm \
+              --outdir "$OUT" \
+              --overwrite
+          }
+
           set +e
-          npx -y apkmirror-downloader@2.0.11 download \
-            intsig-pte camscanner-phone-pdf-creator \
-            --version "$REF_VERSION" \
+          run_download \
             --arch "arm64-v8a + armeabi" \
             --dpi nodpi \
-            --type bundle \
-            --outfile camscanner-reference.apkm \
-            --outdir "$OUT" \
-            --overwrite
+            --type bundle
           RC=$?
           set -e
 
           if [[ $RC -ne 0 ]] || [[ -z "$(find "$OUT" -maxdepth 1 -type f -size +150M -print -quit)" ]]; then
             echo "First exact-variant attempt did not produce the bundle; retrying version+bundle selection." >&2
             rm -f "$OUT"/*
-            npx -y apkmirror-downloader@2.0.11 download \
-              intsig-pte camscanner-phone-pdf-creator \
-              --version "$REF_VERSION" \
-              --type bundle \
-              --outfile camscanner-reference.apkm \
-              --outdir "$OUT" \
-              --overwrite
+            run_download --type bundle
           fi
 
           BUNDLE=$(find "$OUT" -maxdepth 1 -type f -size +150M -print | head -n 1)
@@ -97,7 +103,6 @@ jobs:
           fi
 
           cp "$BUNDLE" "$RUNNER_TEMP/camscanner-exact.apkm"
-          echo "bundle=$RUNNER_TEMP/camscanner-exact.apkm" >> "$GITHUB_ENV"
           ls -lh "$RUNNER_TEMP/camscanner-exact.apkm"
 
       - name: Preserve exact reference bundle as GitHub artifact
