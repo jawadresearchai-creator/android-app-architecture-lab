@@ -56,12 +56,11 @@ jobs:
           set -euo pipefail
           rm -rf downloads work/camscanner-bundle
           mkdir -p downloads work/camscanner-bundle
+          # APKCombo exposes this historical CamScanner release as a single
+          # bundle variant. Do not pass arch/dpi/type filters here: older
+          # downloader versions throw on the single-variant response.
           node "$APKCD_CLI" download camscanner com.intsig.camscanner \
             --version "$APP_VERSION" \
-            --arch "arm64-v8a" \
-            --dpi "nodpi" \
-            --type "bundle" \
-            --minandroidversion "5.0" \
             --outdir downloads \
             --outfile camscanner
           echo "Downloaded files:"
