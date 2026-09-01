@@ -1,0 +1,114 @@
+name: Analyze Open-Source Scanner Reference
+
+on:
+  push:
+    paths:
+      - "references/makeacopy-reference.yml"
+      - ".github/workflows/analyze-open-source-reference.yml"
+      - "scripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze-reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      REF_NAME: MakeACopy
+      REF_VERSION: v4.6.1
+      REF_SLUG: makeacopy-v4.6.1
+      APK_URL: https://github.com/egdels/makeacopy/releases/download/v4.6.1/MakeACopy-Light-v4.6.1-arm64-v8a-release.apk
+      APK_SHA256: 9710dbd417aaedf1382b776c94489c2b6acb102bca4ec8a2f2a21e535f8cb522
+
+    steps:
+      - name: Checkout lab
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install JADX 1.5.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/install_jadx.sh "$RUNNER_TEMP/jadx"
+          "$RUNNER_TEMP/jadx/bin/jadx" --version
+
+      - name: Download licensed reference APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/reference"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            "$APK_URL" \
+            -o "$RUNNER_TEMP/reference/reference.apk"
+          echo "$APK_SHA256  $RUNNER_TEMP/reference/reference.apk" | sha256sum --check --strict
+          ls -lh "$RUNNER_TEMP/reference/reference.apk"
+
+      - name: Decompile reference APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf work/reference-jadx "reports/$REF_SLUG"
+          mkdir -p work/reference-jadx "reports/$REF_SLUG"
+          "$RUNNER_TEMP/jadx/bin/jadx" \
+            --deobf \
+            --show-bad-code \
+            -d work/reference-jadx \
+            "$RUNNER_TEMP/reference/reference.apk" \
+            2>&1 | tee "reports/$REF_SLUG/JADX_LOG.txt"
+
+      - name: Generate architecture reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/analyze_architecture.py \
+            --jadx-output work/reference-jadx \
+            --input-file "$RUNNER_TEMP/reference/reference.apk" \
+            --reports "reports/$REF_SLUG"
+          {
+            echo "reference=$REF_NAME"
+            echo "version=$REF_VERSION"
+            echo "license=Apache-2.0"
+            echo "source=https://github.com/egdels/makeacopy"
+            echo "apk_sha256=$APK_SHA256"
+            echo "jadx_version=$($RUNNER_TEMP/jadx/bin/jadx --version)"
+            echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "reports/$REF_SLUG/REFERENCE_PROVENANCE.txt"
+
+      - name: Upload complete decompilation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REF_SLUG }}-jadx-${{ github.run_id }}
+          path: work/reference-jadx/
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Upload architecture reports artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REF_SLUG }}-reports-${{ github.run_id }}
+          path: reports/${{ env.REF_SLUG }}/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Commit structured reports to lab
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "reports/$REF_SLUG"
+          if git diff --cached --quiet; then
+            echo "No report changes to commit."
+            exit 0
+          fi
+          git commit -m "Analyze $REF_NAME $REF_VERSION with JADX"
+          git push
