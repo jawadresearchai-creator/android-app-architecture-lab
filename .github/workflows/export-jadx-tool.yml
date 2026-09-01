@@ -1,0 +1,40 @@
+name: Export JADX Tool
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/export-jadx-tool.yml"
+      - "scripts/install_jadx.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout lab
+        uses: actions/checkout@v5
+
+      - name: Download and verify JADX 1.5.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip"
+          SHA="545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974"
+          curl --fail --location --retry 3 "$URL" -o "$RUNNER_TEMP/jadx-1.5.6.zip"
+          echo "$SHA  $RUNNER_TEMP/jadx-1.5.6.zip" | sha256sum --check --strict
+          unzip -q "$RUNNER_TEMP/jadx-1.5.6.zip" -d "$RUNNER_TEMP/jadx-test"
+          chmod +x "$RUNNER_TEMP/jadx-test/bin/jadx"
+          "$RUNNER_TEMP/jadx-test/bin/jadx" --version
+
+      - name: Upload verified JADX distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadx-1.5.6-distribution
+          path: ${{ runner.temp }}/jadx-1.5.6.zip
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
