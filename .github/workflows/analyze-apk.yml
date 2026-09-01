@@ -59,7 +59,7 @@ jobs:
               | sort)
 
             if [[ ${#PACKAGES[@]} -eq 0 ]]; then
-              echo "No Android package is present. Toolchain smoke test only."
+              echo "No Android package is present. Running toolchain decompilation self-test only."
               echo "has_package=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -77,6 +77,34 @@ jobs:
           echo "has_package=true" >> "$GITHUB_OUTPUT"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "basename=$(basename "$TARGET")" >> "$GITHUB_OUTPUT"
+
+      - name: Decompilation self-test
+        if: steps.target.outputs.has_package != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_ROOT="$RUNNER_TEMP/jadx-selftest"
+          mkdir -p "$TEST_ROOT/src/lab" "$TEST_ROOT/classes" "$TEST_ROOT/out"
+          cat > "$TEST_ROOT/src/lab/HelloArchitectureLab.java" <<'JAVA'
+          package lab;
+          public class HelloArchitectureLab {
+              public static String marker() { return "JADX_ARCHITECTURE_LAB_OK"; }
+          }
+          JAVA
+          javac -d "$TEST_ROOT/classes" "$TEST_ROOT/src/lab/HelloArchitectureLab.java"
+          jar --create --file "$TEST_ROOT/fixture.jar" -C "$TEST_ROOT/classes" .
+          "$RUNNER_TEMP/jadx/bin/jadx" -d "$TEST_ROOT/out" "$TEST_ROOT/fixture.jar"
+          RECOVERED=$(find "$TEST_ROOT/out" -type f -name 'HelloArchitectureLab.*' | head -n 1 || true)
+          if [[ -z "$RECOVERED" ]]; then
+            echo "JADX self-test failed: expected class was not decompiled" >&2
+            exit 1
+          fi
+          grep -R "JADX_ARCHITECTURE_LAB_OK" "$TEST_ROOT/out" >/dev/null
+          {
+            echo "JADX self-test: PASS"
+            echo "Recovered: $RECOVERED"
+            "$RUNNER_TEMP/jadx/bin/jadx" --version
+          } | tee jadx-selftest.txt
 
       - name: Decompile with JADX
         if: steps.target.outputs.has_package == 'true'
@@ -146,6 +174,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: jadx-toolchain-smoke-${{ github.run_id }}
-          path: jadx-version.txt
+          path: |
+            jadx-version.txt
+            jadx-selftest.txt
           if-no-files-found: error
           retention-days: 7
