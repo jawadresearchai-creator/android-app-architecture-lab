@@ -1,0 +1,202 @@
+name: Analyze Exact CamScanner Reference
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/analyze-camscanner-exact.yml"
+      - "scripts/**"
+
+permissions:
+  contents: write
+
+jobs:
+  analyze-camscanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      REF_NAME: CamScanner
+      REF_VERSION: 7.23.5.2608050000
+      REF_VERSION_CODE: 72351
+      REF_PACKAGE: com.intsig.camscanner
+      REF_SHA256: 2f62abc367c8e34c6234bde6108c5b317aec027e132237a8673cf43c11cb0a52
+      REF_SLUG: camscanner-7.23.5.2608050000
+
+    steps:
+      - name: Checkout lab
+        uses: actions/checkout@v5
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install JADX 1.5.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/install_jadx.sh "$RUNNER_TEMP/jadx"
+          "$RUNNER_TEMP/jadx/bin/jadx" --version | tee jadx-version.txt
+
+      - name: Fetch exact APKMirror bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/camscanner"
+          mkdir -p "$OUT"
+
+          # APKMirror blocks ordinary scripted downloads. This maintained MIT tool
+          # follows the normal APKMirror download flow. We still trust nothing
+          # until the downloaded bytes match the SHA-256 of the user-supplied APKM.
+          set +e
+          npx -y apkmirror-downloader@2.0.11 download \
+            intsig-pte camscanner-phone-pdf-creator \
+            --version "$REF_VERSION" \
+            --arch "arm64-v8a + armeabi" \
+            --dpi nodpi \
+            --type bundle \
+            --outfile camscanner-reference.apkm \
+            --outdir "$OUT" \
+            --overwrite
+          RC=$?
+          set -e
+
+          if [[ $RC -ne 0 ]] || [[ -z "$(find "$OUT" -maxdepth 1 -type f -size +150M -print -quit)" ]]; then
+            echo "First exact-variant attempt did not produce the bundle; retrying version+bundle selection." >&2
+            rm -f "$OUT"/*
+            npx -y apkmirror-downloader@2.0.11 download \
+              intsig-pte camscanner-phone-pdf-creator \
+              --version "$REF_VERSION" \
+              --type bundle \
+              --outfile camscanner-reference.apkm \
+              --outdir "$OUT" \
+              --overwrite
+          fi
+
+          BUNDLE=$(find "$OUT" -maxdepth 1 -type f -size +150M -print | head -n 1)
+          if [[ -z "$BUNDLE" ]]; then
+            echo "No APKM bundle larger than 150 MB was downloaded." >&2
+            find "$OUT" -maxdepth 2 -type f -ls || true
+            exit 1
+          fi
+
+          ACTUAL=$(sha256sum "$BUNDLE" | awk '{print $1}')
+          echo "Downloaded bundle: $BUNDLE"
+          echo "Expected SHA-256: $REF_SHA256"
+          echo "Actual SHA-256:   $ACTUAL"
+          if [[ "$ACTUAL" != "$REF_SHA256" ]]; then
+            echo "Downloaded file is not byte-identical to the user-supplied APKM; refusing analysis." >&2
+            exit 1
+          fi
+
+          cp "$BUNDLE" "$RUNNER_TEMP/camscanner-exact.apkm"
+          echo "bundle=$RUNNER_TEMP/camscanner-exact.apkm" >> "$GITHUB_ENV"
+          ls -lh "$RUNNER_TEMP/camscanner-exact.apkm"
+
+      - name: Preserve exact reference bundle as GitHub artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: camscanner-exact-apkm-${{ github.run_id }}
+          path: ${{ runner.temp }}/camscanner-exact.apkm
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Decompile exact APKM with JADX
+        shell: bash
+        run: |
+          set -u
+          rm -rf work/camscanner-jadx "reports/$REF_SLUG"
+          mkdir -p work/camscanner-jadx "reports/$REF_SLUG"
+          set +e
+          "$RUNNER_TEMP/jadx/bin/jadx" \
+            --deobf \
+            --show-bad-code \
+            --call-graph json \
+            -d work/camscanner-jadx \
+            "$RUNNER_TEMP/camscanner-exact.apkm" \
+            2>&1 | tee "reports/$REF_SLUG/JADX_LOG.txt"
+          JADX_RC=${PIPESTATUS[0]}
+          set -e
+          echo "$JADX_RC" > "reports/$REF_SLUG/JADX_EXIT_CODE.txt"
+          ERR_COUNT=$(grep -oE 'finished with errors, count: [0-9]+' "reports/$REF_SLUG/JADX_LOG.txt" | tail -1 | grep -oE '[0-9]+' || true)
+          echo "${ERR_COUNT:-0}" > "reports/$REF_SLUG/JADX_ERROR_COUNT.txt"
+          echo "JADX exit code: $JADX_RC; reported errors: ${ERR_COUNT:-0}"
+          test -d work/camscanner-jadx/sources || test -d work/camscanner-jadx/resources
+
+      - name: Generate architecture reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/analyze_architecture.py \
+            --jadx-output work/camscanner-jadx \
+            --input-file "$RUNNER_TEMP/camscanner-exact.apkm" \
+            --reports "reports/$REF_SLUG"
+          {
+            echo "reference=$REF_NAME"
+            echo "package=$REF_PACKAGE"
+            echo "version=$REF_VERSION"
+            echo "version_code=$REF_VERSION_CODE"
+            echo "user_supplied_apkm_sha256=$REF_SHA256"
+            echo "downloaded_apkm_sha256=$(sha256sum "$RUNNER_TEMP/camscanner-exact.apkm" | awk '{print $1}')"
+            echo "byte_identical_to_user_upload=true"
+            echo "jadx_version=$($RUNNER_TEMP/jadx/bin/jadx --version)"
+            echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "usage=clean-room feature and architecture analysis; do not copy proprietary source/assets"
+          } > "reports/$REF_SLUG/REFERENCE_PROVENANCE.txt"
+
+      - name: Add native-engine inventory from APKM splits
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMP="$RUNNER_TEMP/camscanner-native"
+          mkdir -p "$TMP"
+          unzip -q "$RUNNER_TEMP/camscanner-exact.apkm" -d "$TMP"
+          {
+            echo "# Native Engine Inventory"
+            echo
+            echo "Native libraries recovered from all APKM split APKs."
+            echo
+            for apk in "$TMP"/*.apk; do
+              unzip -Z1 "$apk" 2>/dev/null | grep -E '^lib/.+\.so$' || true
+            done | sort -u | sed 's/^/- `/' | sed 's/$/`/'
+          } > "reports/$REF_SLUG/NATIVE_ENGINE_INVENTORY.md"
+
+      - name: Upload complete JADX output
+        uses: actions/upload-artifact@v4
+        with:
+          name: camscanner-jadx-${{ github.run_id }}
+          path: work/camscanner-jadx/
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Upload architecture reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: camscanner-reports-${{ github.run_id }}
+          path: reports/${{ env.REF_SLUG }}/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Commit structured reports to lab
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+          git add "reports/$REF_SLUG"
+          if git diff --cached --quiet; then
+            echo "No report changes to commit."
+            exit 0
+          fi
+          git commit -m "Analyze exact CamScanner $REF_VERSION reference"
+          git push origin HEAD:main
