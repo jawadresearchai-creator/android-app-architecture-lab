@@ -20,7 +20,9 @@ jobs:
       REF_VERSION: 7.23.5.2608050000
       REF_VERSION_CODE: 72351
       REF_PACKAGE: com.intsig.camscanner
-      REF_SHA256: 2f62abc367c8e34c6234bde6108c5b317aec027e132237a8673cf43c11cb0a52
+      USER_APKM_SHA256: 2f62abc367c8e34c6234bde6108c5b317aec027e132237a8673cf43c11cb0a52
+      USER_BASE_SHA256: 801514f2226f4cf35ee1992260b456c221847d8f8a212c4d0e06d17b1b31f973
+      USER_BASE_MD5: 9ac9500c7d7062a2a501d05fe0434dd7
       REF_SLUG: camscanner-7.23.5.2608050000
 
     steps:
@@ -33,11 +35,6 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Set up Node 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
       - name: Install JADX 1.5.6
         shell: bash
         run: |
@@ -45,76 +42,69 @@ jobs:
           bash scripts/install_jadx.sh "$RUNNER_TEMP/jadx"
           "$RUNNER_TEMP/jadx/bin/jadx" --version | tee jadx-version.txt
 
-      - name: Fetch exact APKMirror bundle
+      - name: Download version-pinned CamScanner XAPK from APKPure
         shell: bash
         run: |
           set -euo pipefail
-          OUT="$RUNNER_TEMP/camscanner"
-          APKMD_ROOT="$RUNNER_TEMP/apkmd"
-          mkdir -p "$OUT" "$APKMD_ROOT"
+          XAPK="$RUNNER_TEMP/camscanner-reference.xapk"
+          URL="https://d.apkpure.com/b/XAPK/${REF_PACKAGE}?versionCode=${REF_VERSION_CODE}&nc=arm64-v8a&sv=21"
+          echo "Downloading public version-pinned XAPK: $REF_PACKAGE code $REF_VERSION_CODE"
+          curl --fail --location --retry 4 --retry-delay 3 \
+            -A "Mozilla/5.0" \
+            "$URL" -o "$XAPK"
+          test -s "$XAPK"
+          ls -lh "$XAPK"
+          file "$XAPK"
+          echo "xapk_sha256=$(sha256sum "$XAPK" | awk '{print $1}')" >> "$GITHUB_ENV"
 
-          # Install the maintained downloader locally. Its published npm bin wrapper
-          # currently lacks a usable shebang on Linux, so invoke the JS CLI with Node.
-          cd "$APKMD_ROOT"
-          npm init -y >/dev/null 2>&1
-          npm install --no-audit --no-fund apkmirror-downloader@2.0.11
-          APKMD="$APKMD_ROOT/node_modules/apkmirror-downloader/dist/cli.js"
-          test -f "$APKMD"
-          cd "$GITHUB_WORKSPACE"
+      - name: Extract and verify byte-identical base APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          XAPK="$RUNNER_TEMP/camscanner-reference.xapk"
+          OUT="$RUNNER_TEMP/camscanner-xapk"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          unzip -q "$XAPK" -d "$OUT"
 
-          run_download() {
-            node "$APKMD" download \
-              intsig-pte camscanner-phone-pdf-creator \
-              --version "$REF_VERSION" \
-              "$@" \
-              --outfile camscanner-reference.apkm \
-              --outdir "$OUT" \
-              --overwrite
-          }
+          echo "APK files in XAPK:"
+          find "$OUT" -type f -iname '*.apk' -printf '%s %p\n' | sort -nr
 
-          set +e
-          run_download \
-            --arch "arm64-v8a + armeabi" \
-            --dpi nodpi \
-            --type bundle
-          RC=$?
-          set -e
+          MATCH=""
+          while IFS= read -r -d '' apk; do
+            SHA=$(sha256sum "$apk" | awk '{print $1}')
+            MD5=$(md5sum "$apk" | awk '{print $1}')
+            echo "candidate=$(basename "$apk") sha256=$SHA md5=$MD5"
+            if [[ "$SHA" == "$USER_BASE_SHA256" && "$MD5" == "$USER_BASE_MD5" ]]; then
+              MATCH="$apk"
+              break
+            fi
+          done < <(find "$OUT" -type f -iname '*.apk' -print0)
 
-          if [[ $RC -ne 0 ]] || [[ -z "$(find "$OUT" -maxdepth 1 -type f -size +150M -print -quit)" ]]; then
-            echo "First exact-variant attempt did not produce the bundle; retrying version+bundle selection." >&2
-            rm -f "$OUT"/*
-            run_download --type bundle
-          fi
-
-          BUNDLE=$(find "$OUT" -maxdepth 1 -type f -size +150M -print | head -n 1)
-          if [[ -z "$BUNDLE" ]]; then
-            echo "No APKM bundle larger than 150 MB was downloaded." >&2
-            find "$OUT" -maxdepth 2 -type f -ls || true
+          if [[ -z "$MATCH" ]]; then
+            echo "No APK in the downloaded XAPK is byte-identical to the user-supplied base.apk." >&2
+            echo "Expected SHA-256: $USER_BASE_SHA256" >&2
+            echo "Expected MD5: $USER_BASE_MD5" >&2
             exit 1
           fi
 
-          ACTUAL=$(sha256sum "$BUNDLE" | awk '{print $1}')
-          echo "Downloaded bundle: $BUNDLE"
-          echo "Expected SHA-256: $REF_SHA256"
-          echo "Actual SHA-256:   $ACTUAL"
-          if [[ "$ACTUAL" != "$REF_SHA256" ]]; then
-            echo "Downloaded file is not byte-identical to the user-supplied APKM; refusing analysis." >&2
-            exit 1
-          fi
+          cp "$MATCH" "$RUNNER_TEMP/camscanner-exact-base.apk"
+          echo "Verified byte-identical executable base APK: $MATCH"
+          sha256sum "$RUNNER_TEMP/camscanner-exact-base.apk"
+          md5sum "$RUNNER_TEMP/camscanner-exact-base.apk"
 
-          cp "$BUNDLE" "$RUNNER_TEMP/camscanner-exact.apkm"
-          ls -lh "$RUNNER_TEMP/camscanner-exact.apkm"
-
-      - name: Preserve exact reference bundle as GitHub artifact
+      - name: Preserve verified reference XAPK and exact base as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: camscanner-exact-apkm-${{ github.run_id }}
-          path: ${{ runner.temp }}/camscanner-exact.apkm
+          name: camscanner-verified-input-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/camscanner-reference.xapk
+            ${{ runner.temp }}/camscanner-exact-base.apk
           retention-days: 7
           if-no-files-found: error
           compression-level: 0
 
-      - name: Decompile exact APKM with JADX
+      - name: Decompile exact base APK with JADX
         shell: bash
         run: |
           set -u
@@ -126,7 +116,7 @@ jobs:
             --show-bad-code \
             --call-graph json \
             -d work/camscanner-jadx \
-            "$RUNNER_TEMP/camscanner-exact.apkm" \
+            "$RUNNER_TEMP/camscanner-exact-base.apk" \
             2>&1 | tee "reports/$REF_SLUG/JADX_LOG.txt"
           JADX_RC=${PIPESTATUS[0]}
           set -e
@@ -142,34 +132,37 @@ jobs:
           set -euo pipefail
           python3 scripts/analyze_architecture.py \
             --jadx-output work/camscanner-jadx \
-            --input-file "$RUNNER_TEMP/camscanner-exact.apkm" \
+            --input-file "$RUNNER_TEMP/camscanner-exact-base.apk" \
             --reports "reports/$REF_SLUG"
           {
             echo "reference=$REF_NAME"
             echo "package=$REF_PACKAGE"
             echo "version=$REF_VERSION"
             echo "version_code=$REF_VERSION_CODE"
-            echo "user_supplied_apkm_sha256=$REF_SHA256"
-            echo "downloaded_apkm_sha256=$(sha256sum "$RUNNER_TEMP/camscanner-exact.apkm" | awk '{print $1}')"
-            echo "byte_identical_to_user_upload=true"
+            echo "user_supplied_apkm_sha256=$USER_APKM_SHA256"
+            echo "user_supplied_base_sha256=$USER_BASE_SHA256"
+            echo "user_supplied_base_md5=$USER_BASE_MD5"
+            echo "downloaded_xapk_sha256=$xapk_sha256"
+            echo "analyzed_base_sha256=$(sha256sum "$RUNNER_TEMP/camscanner-exact-base.apk" | awk '{print $1}')"
+            echo "analyzed_base_md5=$(md5sum "$RUNNER_TEMP/camscanner-exact-base.apk" | awk '{print $1}')"
+            echo "base_byte_identical_to_user_upload=true"
             echo "jadx_version=$($RUNNER_TEMP/jadx/bin/jadx --version)"
             echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "usage=clean-room feature and architecture analysis; do not copy proprietary source/assets"
           } > "reports/$REF_SLUG/REFERENCE_PROVENANCE.txt"
 
-      - name: Add native-engine inventory from APKM splits
+      - name: Add native-engine inventory from downloaded XAPK
         shell: bash
         run: |
           set -euo pipefail
-          TMP="$RUNNER_TEMP/camscanner-native"
-          mkdir -p "$TMP"
-          unzip -q "$RUNNER_TEMP/camscanner-exact.apkm" -d "$TMP"
+          OUT="$RUNNER_TEMP/camscanner-xapk"
           {
             echo "# Native Engine Inventory"
             echo
-            echo "Native libraries recovered from all APKM split APKs."
+            echo "Native libraries present in the version-pinned public XAPK whose base APK was verified byte-identical to the user upload."
             echo
-            for apk in "$TMP"/*.apk; do
+            for apk in "$OUT"/**/*.apk "$OUT"/*.apk; do
+              [[ -f "$apk" ]] || continue
               unzip -Z1 "$apk" 2>/dev/null | grep -E '^lib/.+\.so$' || true
             done | sort -u | sed 's/^/- `/' | sed 's/$/`/'
           } > "reports/$REF_SLUG/NATIVE_ENGINE_INVENTORY.md"
@@ -203,5 +196,5 @@ jobs:
             echo "No report changes to commit."
             exit 0
           fi
-          git commit -m "Analyze exact CamScanner $REF_VERSION reference"
+          git commit -m "Analyze byte-identical CamScanner $REF_VERSION base with JADX"
           git push origin HEAD:main
