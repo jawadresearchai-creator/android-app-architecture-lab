@@ -1,0 +1,181 @@
+name: Analyze CamScanner Uploaded Version
+
+on:
+  push:
+    paths:
+      - ".github/workflows/analyze-camscanner-uploaded-version.yml"
+      - "scripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze-camscanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      APP_VERSION: "7.23.5.2608050000"
+      EXPECTED_BASE_SHA256: "801514f2226f4cf35ee1992260b456c221847d8f8a212c4d0e06d17b1b31f973"
+      REPORT_DIR: "reports/camscanner-7.23.5.2608050000-jadx"
+
+    steps:
+      - name: Checkout lab
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install JADX 1.5.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/install_jadx.sh "$RUNNER_TEMP/jadx"
+          "$RUNNER_TEMP/jadx/bin/jadx" --version
+
+      - name: Install APKMirror downloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --no-save apkmirror-downloader@2.0.11 typescript@5.5.4
+          npx apkmd --help >/dev/null
+
+      - name: Download exact CamScanner release
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf downloads work/camscanner-bundle
+          mkdir -p downloads work/camscanner-bundle
+          npx apkmd download intsig-pte camscanner-phone-pdf-creator \
+            --version "$APP_VERSION" \
+            --arch "arm64-v8a" \
+            --dpi "nodpi" \
+            --type "bundle" \
+            --minandroidversion "5.0" \
+            --outdir downloads \
+            --outfile camscanner
+          echo "Downloaded files:"
+          find downloads -maxdepth 2 -type f -printf '%p %s bytes\n'
+          DOWNLOADED="$(find downloads -type f | head -n 1)"
+          test -n "$DOWNLOADED"
+          cp "$DOWNLOADED" "$RUNNER_TEMP/camscanner-download"
+
+      - name: Extract bundle and verify uploaded base APK fingerprint
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/camscanner-bundle
+          if unzip -t "$RUNNER_TEMP/camscanner-download" >/dev/null 2>&1; then
+            unzip -q "$RUNNER_TEMP/camscanner-download" -d work/camscanner-bundle
+          else
+            cp "$RUNNER_TEMP/camscanner-download" work/camscanner-bundle/base.apk
+          fi
+          BASE="$(find work/camscanner-bundle -type f -name 'base.apk' | head -n 1)"
+          if [[ -z "$BASE" ]]; then
+            BASE="$(find work/camscanner-bundle -type f -name '*.apk' -printf '%s %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+          fi
+          test -f "$BASE"
+          ACTUAL="$(sha256sum "$BASE" | awk '{print $1}')"
+          echo "base_path=$BASE" >> "$GITHUB_OUTPUT"
+          echo "actual_sha256=$ACTUAL" >> "$GITHUB_OUTPUT"
+          echo "Expected base SHA-256: $EXPECTED_BASE_SHA256"
+          echo "Actual base SHA-256:   $ACTUAL"
+          if [[ "$ACTUAL" != "$EXPECTED_BASE_SHA256" ]]; then
+            echo "The downloader returned a different base APK than the uploaded APKM. Refusing to label it an exact match." >&2
+            exit 2
+          fi
+
+      - name: Decompile exact base APK with JADX
+        id: jadxrun
+        shell: bash
+        env:
+          BASE_APK: ${{ steps.verify.outputs.base_path }}
+        run: |
+          set -u
+          rm -rf work/camscanner-jadx "$REPORT_DIR"
+          mkdir -p work/camscanner-jadx "$REPORT_DIR"
+          set +e
+          "$RUNNER_TEMP/jadx/bin/jadx" \
+            --deobf \
+            --show-bad-code \
+            -d work/camscanner-jadx \
+            "$BASE_APK" \
+            2>&1 | tee "$REPORT_DIR/JADX_LOG.txt"
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "$RC" > "$REPORT_DIR/JADX_EXIT_CODE.txt"
+          echo "jadx_exit_code=$RC" >> "$GITHUB_OUTPUT"
+          test -d work/camscanner-jadx/sources
+
+      - name: Generate architecture reports
+        shell: bash
+        env:
+          BASE_APK: ${{ steps.verify.outputs.base_path }}
+        run: |
+          set -euo pipefail
+          python3 scripts/analyze_architecture.py \
+            --jadx-output work/camscanner-jadx \
+            --input-file "$BASE_APK" \
+            --reports "$REPORT_DIR"
+          {
+            echo "source=APKMIRROR runtime retrieval"
+            echo "package=com.intsig.camscanner"
+            echo "version=$APP_VERSION"
+            echo "expected_uploaded_base_sha256=$EXPECTED_BASE_SHA256"
+            echo "downloaded_base_sha256=${{ steps.verify.outputs.actual_sha256 }}"
+            echo "jadx_version=$($RUNNER_TEMP/jadx/bin/jadx --version)"
+            echo "jadx_exit_code=${{ steps.jadxrun.outputs.jadx_exit_code }}"
+            echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$REPORT_DIR/PROVENANCE.txt"
+
+      - name: Inventory native libraries from bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "# Native libraries in downloaded bundle"
+            echo
+            find work/camscanner-bundle -type f -name '*.apk' -print0 | while IFS= read -r -d '' apk; do
+              unzip -Z1 "$apk" 2>/dev/null | grep -E '^lib/.+\.so$' || true
+            done | sort -u | sed 's/^/- `/' | sed 's/$/`/'
+          } > "$REPORT_DIR/NATIVE_LIBRARIES.md"
+
+      - name: Upload complete JADX output
+        uses: actions/upload-artifact@v4
+        with:
+          name: camscanner-${{ env.APP_VERSION }}-jadx-${{ github.run_id }}
+          path: work/camscanner-jadx/
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Upload structured reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: camscanner-${{ env.APP_VERSION }}-reports-${{ github.run_id }}
+          path: ${{ env.REPORT_DIR }}/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Commit structured reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$REPORT_DIR"
+          if git diff --cached --quiet; then
+            echo "No report changes to commit."
+            exit 0
+          fi
+          git commit -m "Decompile CamScanner $APP_VERSION with JADX"
+          git push
