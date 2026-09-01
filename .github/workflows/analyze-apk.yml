@@ -1,0 +1,151 @@
+name: Analyze Android Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_path:
+        description: "Repository-relative package path, e.g. input/reference-app.apk (optional when only one package exists)"
+        required: false
+        type: string
+  push:
+    paths:
+      - "input/**"
+      - "scripts/**"
+      - ".github/workflows/analyze-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install and verify JADX 1.5.6
+        id: jadx
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/install_jadx.sh "$RUNNER_TEMP/jadx"
+          "$RUNNER_TEMP/jadx/bin/jadx" --version | tee jadx-version.txt
+
+      - name: Select Android package
+        id: target
+        shell: bash
+        env:
+          MANUAL_TARGET: ${{ github.event.inputs.target_path || '' }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$MANUAL_TARGET" ]]; then
+            if [[ ! -f "$MANUAL_TARGET" ]]; then
+              echo "Requested target does not exist: $MANUAL_TARGET" >&2
+              exit 1
+            fi
+            TARGET="$MANUAL_TARGET"
+          else
+            mapfile -t PACKAGES < <(find input -maxdepth 1 -type f \
+              \( -iname '*.apk' -o -iname '*.xapk' -o -iname '*.apkm' -o -iname '*.dex' -o -iname '*.jar' \) \
+              | sort)
+
+            if [[ ${#PACKAGES[@]} -eq 0 ]]; then
+              echo "No Android package is present. Toolchain smoke test only."
+              echo "has_package=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [[ ${#PACKAGES[@]} -gt 1 ]]; then
+              echo "More than one package exists in input/. Run the workflow manually and set target_path." >&2
+              printf '  %s\n' "${PACKAGES[@]}" >&2
+              exit 1
+            fi
+
+            TARGET="${PACKAGES[0]}"
+          fi
+
+          echo "Selected: $TARGET"
+          echo "has_package=true" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "basename=$(basename "$TARGET")" >> "$GITHUB_OUTPUT"
+
+      - name: Decompile with JADX
+        if: steps.target.outputs.has_package == 'true'
+        shell: bash
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+        run: |
+          set -euo pipefail
+          rm -rf work reports
+          mkdir -p work/jadx-output reports
+          "$RUNNER_TEMP/jadx/bin/jadx" \
+            --deobf \
+            --show-bad-code \
+            -d work/jadx-output \
+            "$TARGET" \
+            2>&1 | tee work/jadx.log
+
+      - name: Generate architecture reports
+        if: steps.target.outputs.has_package == 'true'
+        shell: bash
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+        run: |
+          set -euo pipefail
+          python3 scripts/analyze_architecture.py \
+            --jadx-output work/jadx-output \
+            --input-file "$TARGET" \
+            --reports reports
+          cp jadx-version.txt reports/JADX_VERSION.txt
+          cp work/jadx.log reports/JADX_LOG.txt
+
+      - name: Add run metadata
+        if: steps.target.outputs.has_package == 'true'
+        shell: bash
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+        run: |
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "commit=${GITHUB_SHA}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "input=${TARGET}"
+            echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > reports/RUN_METADATA.txt
+
+      - name: Upload architecture reports
+        if: steps.target.outputs.has_package == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: architecture-reports-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload complete JADX output
+        if: steps.target.outputs.has_package == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadx-output-${{ github.run_id }}
+          path: work/jadx-output/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+      - name: Upload smoke-test proof
+        if: steps.target.outputs.has_package != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadx-toolchain-smoke-${{ github.run_id }}
+          path: jadx-version.txt
+          if-no-files-found: error
+          retention-days: 7
