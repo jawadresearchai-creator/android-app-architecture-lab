@@ -18,7 +18,7 @@ jobs:
       APP_VERSION: "7.23.5.2608050000"
       EXPECTED_BASE_SHA256: "801514f2226f4cf35ee1992260b456c221847d8f8a212c4d0e06d17b1b31f973"
       REPORT_DIR: "reports/camscanner-7.23.5.2608050000-jadx"
-      APKMD_CLI: "node_modules/apkmirror-downloader/dist/cli.js"
+      APKCD_CLI: "node_modules/@nirewen/apkcombo-downloader/dist/cli.js"
 
     steps:
       - name: Checkout lab
@@ -42,13 +42,13 @@ jobs:
           bash scripts/install_jadx.sh "$RUNNER_TEMP/jadx"
           "$RUNNER_TEMP/jadx/bin/jadx" --version
 
-      - name: Install APKMirror downloader
+      - name: Install APKCombo downloader
         shell: bash
         run: |
           set -euo pipefail
-          npm install --no-save apkmirror-downloader@2.0.11 typescript@5.5.4
-          test -f "$APKMD_CLI"
-          node "$APKMD_CLI" --help >/dev/null
+          npm install --no-save @nirewen/apkcombo-downloader@1.0.3 typescript@5.5.4
+          test -f "$APKCD_CLI"
+          node "$APKCD_CLI" --help >/dev/null
 
       - name: Download exact CamScanner release
         shell: bash
@@ -56,7 +56,7 @@ jobs:
           set -euo pipefail
           rm -rf downloads work/camscanner-bundle
           mkdir -p downloads work/camscanner-bundle
-          node "$APKMD_CLI" download intsig-pte camscanner-phone-pdf-creator \
+          node "$APKCD_CLI" download camscanner com.intsig.camscanner \
             --version "$APP_VERSION" \
             --arch "arm64-v8a" \
             --dpi "nodpi" \
@@ -92,9 +92,18 @@ jobs:
           echo "Expected base SHA-256: $EXPECTED_BASE_SHA256"
           echo "Actual base SHA-256:   $ACTUAL"
           if [[ "$ACTUAL" != "$EXPECTED_BASE_SHA256" ]]; then
-            echo "The downloader returned a different base APK than the uploaded APKM. Refusing to label it an exact match." >&2
+            echo "The provider returned a different base APK than the uploaded APKM. Refusing to label it an exact match." >&2
             exit 2
           fi
+
+      - name: Preserve verified input bundle as GitHub artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: camscanner-${{ env.APP_VERSION }}-verified-input-${{ github.run_id }}
+          path: ${{ runner.temp }}/camscanner-download
+          retention-days: 30
+          if-no-files-found: error
+          compression-level: 0
 
       - name: Decompile exact base APK with JADX
         id: jadxrun
@@ -129,7 +138,7 @@ jobs:
             --input-file "$BASE_APK" \
             --reports "$REPORT_DIR"
           {
-            echo "source=APKMIRROR runtime retrieval"
+            echo "source=APKCombo runtime retrieval"
             echo "package=com.intsig.camscanner"
             echo "version=$APP_VERSION"
             echo "expected_uploaded_base_sha256=$EXPECTED_BASE_SHA256"
